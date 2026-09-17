@@ -1,0 +1,9 @@
+langgraph
+langchain-core
+langchain-groq
+pydantic
+pytest
+python-dotenv
+fastapi
+uvicorn
+python-multipart
