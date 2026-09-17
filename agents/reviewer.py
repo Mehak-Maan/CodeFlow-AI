@@ -29,10 +29,18 @@ def parse_review_response(content: str) -> ReviewResult:
     elif "```" in cleaned:
         cleaned = cleaned.split("```")[1].split("```")[0].strip()
     
+    def create_result(data: dict) -> ReviewResult:
+        res = ReviewResult(**data)
+        has_critical = any(i.must_fix or i.severity in ["CRITICAL", "HIGH"] for i in res.issues)
+        if not has_critical and (res.score >= 8 or len(res.issues) == 0):
+            res.decision = "APPROVED"
+            res.score = max(res.score, 9)
+        return res
+
     # 1. Direct JSON parse
     try:
         data = json.loads(cleaned)
-        return ReviewResult(**data)
+        return create_result(data)
     except Exception:
         pass
 
@@ -41,7 +49,7 @@ def parse_review_response(content: str) -> ReviewResult:
         sub = cleaned[cleaned.find("{"):cleaned.rfind("}")+1]
         try:
             data = json.loads(sub)
-            return ReviewResult(**data)
+            return create_result(data)
         except Exception:
             pass
 
@@ -58,6 +66,8 @@ def parse_review_response(content: str) -> ReviewResult:
             line_m = re.search(r'"line"\s*:\s*(\d+)', b)
             desc_m = re.search(r'"description"\s*:\s*"([^"]+)"', b)
             sugg_m = re.search(r'"suggestion"\s*:\s*"([^"]+)"', b)
+            must_fix_m = re.search(r'"must_fix"\s*:\s*(true|false)', b, re.IGNORECASE)
+            is_must_fix = (must_fix_m.group(1).lower() == "true") if must_fix_m else (sev_m.group(1).upper() in ["CRITICAL", "HIGH"])
             if sev_m and desc_m:
                 issues.append(Issue(
                     severity=sev_m.group(1),
@@ -65,14 +75,27 @@ def parse_review_response(content: str) -> ReviewResult:
                     line=int(line_m.group(1)) if line_m else None,
                     description=desc_m.group(1),
                     suggestion=sugg_m.group(1) if sugg_m else None,
-                    must_fix=True
+                    must_fix=is_must_fix
                 ))
     
-    is_approved = "APPROVED" in content.upper() and len(issues) == 0
+    # Check if there are any critical/breaking issues
+    has_critical_bugs = any(i.must_fix or i.severity in ["CRITICAL", "HIGH"] for i in issues)
+    
+    # Extract decision and score from content if possible
+    score_m = re.search(r'"score"\s*:\s*(\d+)', content)
+    parsed_score = int(score_m.group(1)) if score_m else (9 if not has_critical_bugs else 4)
+    
+    if not has_critical_bugs and ("APPROVED" in content.upper() or parsed_score >= 8 or len(issues) == 0):
+        decision = "APPROVED"
+        score = max(parsed_score, 9)
+    else:
+        decision = "REJECTED"
+        score = min(parsed_score, 6)
+
     return ReviewResult(
-        decision="APPROVED" if is_approved else "REJECTED",
+        decision=decision,
         summary="Automated code review completed.",
-        score=9 if is_approved else 4,
+        score=score,
         issues=issues
     )
 
@@ -87,16 +110,16 @@ def reviewer_node(state: dict) -> dict:
             "Required JSON format:\n"
             '{\n'
             '  "decision": "APPROVED" or "REJECTED",\n'
-            '  "summary": "Clear summary of the code quality and security findings",\n'
-            '  "score": 1-10,\n'
+            '  "summary": "Clear summary of the code quality and findings",\n'
+            '  "score": integer 1-10,\n'
             '  "issues": [\n'
             '    {\n'
-            '      "severity": "CRITICAL" or "HIGH" or "MEDIUM" or "LOW",\n'
+            '      "severity": "CRITICAL" or "HIGH" or "MEDIUM" or "LOW" or "INFO",\n'
             '      "title": "Clear descriptive title of the bug",\n'
-            '      "line": integer line number,\n'
+            '      "line": integer line number or null,\n'
             '      "description": "What is broken and why it fails",\n'
             '      "suggestion": "Exact fix applied to solve the bug",\n'
-            '      "must_fix": true\n'
+            '      "must_fix": true or false\n'
             '    }\n'
             '  ]\n'
             '}'

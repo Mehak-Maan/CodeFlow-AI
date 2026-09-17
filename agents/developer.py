@@ -94,10 +94,14 @@ Current code in file '{filename}':
 {current_code}
 
 Fix ALL bugs in the code.
-For EVERY bug you fix, add an inline comment directly above the fixed line:
+Ensure:
+1. All reported issues are completely and cleanly resolved.
+2. Boundary and edge conditions are properly handled (e.g. overdraft checks, non-negative inputs, proper list filtering, min vs max).
+3. If the file contains embedded unit tests (e.g. test_* functions), ensure your fixes satisfy ALL of them.
+4. For EVERY bug you fix, add an inline comment directly above the fixed line:
 # [FIXED]: <Clear short explanation of what was fixed and why>
 (or // [FIXED]: ... for JavaScript/TypeScript/Java/C++).
-Return ONLY the complete fixed code with no markdown fences, no conversational text outside the code.
+5. Return ONLY the complete fixed code with no markdown fences, no conversational text outside the code.
 """
     
     try:
