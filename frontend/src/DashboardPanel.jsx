@@ -510,7 +510,11 @@ export default function DashboardPanel({
                           {item.developer.tests && (
                             <div className="step-tests-row">
                               <span>🧪 Tests:</span>
-                              <span className="test-pass">{item.developer.tests.passed} Passed</span>
+                              {item.developer.tests.passed === -1 ? (
+                                <span className="test-none">No test functions found</span>
+                              ) : (
+                                <span className="test-pass">{item.developer.tests.passed} Passed</span>
+                              )}
                               {item.developer.tests.failed > 0 && (
                                 <span className="test-fail">{item.developer.tests.failed} Failed</span>
                               )}

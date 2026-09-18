@@ -6,41 +6,61 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from schemas.review import ReviewResult, Issue
 from agents.prompts import REVIEWER_PROMPT
 
+from dotenv import load_dotenv
+
+dotenv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+else:
+    load_dotenv()
+
+# Groq models in priority order — verified available on this account
 MODELS_PRIORITY = [
-    ("openai/gpt-oss-120b", 4000),
-    ("openai/gpt-oss-20b", 3000),
-    ("qwen/qwen3.8-27b", 900)
+    ("openai/gpt-oss-120b", 8192),
+    ("openai/gpt-oss-20b",  8192),
+    ("qwen/qwen3.8-27b",    8192),
+    ("groq/compound-mini",  4096),
 ]
 
 def invoke_llm_with_fallback(messages, temperature=0.0):
     last_err = None
+    api_key = os.getenv("GROQ_API_KEY")
     for model_name, max_tokens in MODELS_PRIORITY:
         try:
-            llm = ChatGroq(model_name=model_name, temperature=temperature, max_tokens=max_tokens)
+            llm = ChatGroq(model_name=model_name, temperature=temperature, max_tokens=max_tokens, api_key=api_key)
             return llm.invoke(messages)
         except Exception as e:
             last_err = e
     raise last_err or RuntimeError("No models available in MODELS_PRIORITY")
 
 def parse_review_response(content: str) -> ReviewResult:
+    """Parse LLM response into ReviewResult — trust the LLM's score/decision, no inflation."""
     cleaned = content.strip()
     if "```json" in cleaned:
         cleaned = cleaned.split("```json")[1].split("```")[0].strip()
     elif "```" in cleaned:
         cleaned = cleaned.split("```")[1].split("```")[0].strip()
-    
-    def create_result(data: dict) -> ReviewResult:
+
+    def build_result(data: dict) -> ReviewResult:
+        """Build ReviewResult directly from data — no score manipulation."""
         res = ReviewResult(**data)
-        has_critical = any(i.must_fix or i.severity in ["CRITICAL", "HIGH"] for i in res.issues)
-        if not has_critical and (res.score >= 8 or len(res.issues) == 0):
-            res.decision = "APPROVED"
-            res.score = max(res.score, 9)
+        # Enforce consistency: if any must_fix issue exists, must be REJECTED
+        has_must_fix = any(i.must_fix for i in res.issues)
+        if has_must_fix and res.decision == "APPROVED":
+            res.decision = "REJECTED"
+            res.score = min(res.score, 6)
+        # If APPROVED, score must be >= 7
+        if res.decision == "APPROVED" and res.score < 7:
+            res.score = 7
+        # If REJECTED, score must be <= 6
+        if res.decision == "REJECTED" and res.score > 6:
+            res.score = 6
         return res
 
     # 1. Direct JSON parse
     try:
         data = json.loads(cleaned)
-        return create_result(data)
+        return build_result(data)
     except Exception:
         pass
 
@@ -49,11 +69,11 @@ def parse_review_response(content: str) -> ReviewResult:
         sub = cleaned[cleaned.find("{"):cleaned.rfind("}")+1]
         try:
             data = json.loads(sub)
-            return create_result(data)
+            return build_result(data)
         except Exception:
             pass
 
-    # 3. Regex extract each issue block with title, line, description, suggestion
+    # 3. Regex-based fallback: extract issue blocks
     issues = []
     blocks = re.findall(r'\{[^{}]*"severity"[^{}]*\}', content, re.DOTALL)
     for b in blocks:
@@ -67,7 +87,7 @@ def parse_review_response(content: str) -> ReviewResult:
             desc_m = re.search(r'"description"\s*:\s*"([^"]+)"', b)
             sugg_m = re.search(r'"suggestion"\s*:\s*"([^"]+)"', b)
             must_fix_m = re.search(r'"must_fix"\s*:\s*(true|false)', b, re.IGNORECASE)
-            is_must_fix = (must_fix_m.group(1).lower() == "true") if must_fix_m else (sev_m.group(1).upper() in ["CRITICAL", "HIGH"])
+            is_must_fix = (must_fix_m.group(1).lower() == "true") if must_fix_m else (sev_m.group(1).upper() in ["CRITICAL", "HIGH"] if sev_m else False)
             if sev_m and desc_m:
                 issues.append(Issue(
                     severity=sev_m.group(1),
@@ -77,55 +97,36 @@ def parse_review_response(content: str) -> ReviewResult:
                     suggestion=sugg_m.group(1) if sugg_m else None,
                     must_fix=is_must_fix
                 ))
-    
-    # Check if there are any critical/breaking issues
-    has_critical_bugs = any(i.must_fix or i.severity in ["CRITICAL", "HIGH"] for i in issues)
-    
-    # Extract decision and score from content if possible
+
+    # Determine decision and score from fallback
+    has_must_fix = any(i.must_fix for i in issues)
     score_m = re.search(r'"score"\s*:\s*(\d+)', content)
-    parsed_score = int(score_m.group(1)) if score_m else (9 if not has_critical_bugs else 4)
-    
-    if not has_critical_bugs and ("APPROVED" in content.upper() or parsed_score >= 8 or len(issues) == 0):
+    parsed_score = int(score_m.group(1)) if score_m else (4 if has_must_fix else 7)
+
+    if not has_must_fix and ("APPROVED" in content.upper() or parsed_score >= 7):
         decision = "APPROVED"
-        score = max(parsed_score, 9)
+        score = max(parsed_score, 7)
     else:
         decision = "REJECTED"
         score = min(parsed_score, 6)
 
     return ReviewResult(
         decision=decision,
-        summary="Automated code review completed.",
+        summary="Code review completed (fallback parser).",
         score=score,
         issues=issues
     )
 
 def reviewer_node(state: dict) -> dict:
     code = state.get("current_code", "")
-    
+
     messages = [
         SystemMessage(content=REVIEWER_PROMPT),
         HumanMessage(content=(
-            f"Please review the following code:\n\n```\n{code}\n```\n\n"
-            "IMPORTANT: Return ONLY a single valid JSON object. No markdown fences. No explanation text before or after.\n"
-            "Required JSON format:\n"
-            '{\n'
-            '  "decision": "APPROVED" or "REJECTED",\n'
-            '  "summary": "Clear summary of the code quality and findings",\n'
-            '  "score": integer 1-10,\n'
-            '  "issues": [\n'
-            '    {\n'
-            '      "severity": "CRITICAL" or "HIGH" or "MEDIUM" or "LOW" or "INFO",\n'
-            '      "title": "Clear descriptive title of the bug",\n'
-            '      "line": integer line number or null,\n'
-            '      "description": "What is broken and why it fails",\n'
-            '      "suggestion": "Exact fix applied to solve the bug",\n'
-            '      "must_fix": true or false\n'
-            '    }\n'
-            '  ]\n'
-            '}'
+            f"Review this code and return ONLY the JSON object:\n\n```\n{code}\n```"
         ))
     ]
-    
+
     try:
         result = invoke_llm_with_fallback(messages, temperature=0.0)
         result_obj = parse_review_response(result.content)
@@ -136,13 +137,13 @@ def reviewer_node(state: dict) -> dict:
             score=1,
             issues=[]
         )
-    
+
     review_history = state.get("review_history", [])
     review_history.append(result_obj)
-    
+
     # Increment iteration counter after each review
     iteration = state.get("iteration", 0) + 1
-    
+
     return {
         "review_history": review_history,
         "final_status": result_obj.decision if result_obj.decision == "APPROVED" else None,

@@ -1277,6 +1277,7 @@ html, body, #root {
 }
 .test-pass { color: var(--green); font-weight: 700; }
 .test-fail { color: var(--red); font-weight: 700; }
+.test-none { color: var(--text-muted); font-style: italic; font-size: 0.82rem; }
 
 /* ── TAB 3: BEFORE VS AFTER DIFF ─────────────────────────────────────────── */
 .diff-tab {

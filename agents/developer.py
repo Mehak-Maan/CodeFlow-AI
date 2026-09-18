@@ -10,17 +10,28 @@ from tools.file_tools import read_file, write_file, list_files
 from tools.test_tools import run_tests, run_python
 from schemas.patch import PatchResult, TestMetrics
 
+from dotenv import load_dotenv
+
+dotenv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+else:
+    load_dotenv()
+
+# Real Groq-hosted models in priority order — verified available on this account
 MODELS_PRIORITY = [
-    ("openai/gpt-oss-120b", 4000),
-    ("openai/gpt-oss-20b", 3000),
-    ("qwen/qwen3.8-27b", 900)
+    ("openai/gpt-oss-120b", 8192),
+    ("openai/gpt-oss-20b",  8192),
+    ("qwen/qwen3.8-27b",    8192),
+    ("groq/compound-mini",  4096),
 ]
 
 def invoke_developer_llm_with_fallback(messages, temperature=0.0):
     last_err = None
+    api_key = os.getenv("GROQ_API_KEY")
     for model_name, max_tokens in MODELS_PRIORITY:
         try:
-            llm = ChatGroq(model_name=model_name, temperature=temperature, max_tokens=max_tokens)
+            llm = ChatGroq(model_name=model_name, temperature=temperature, max_tokens=max_tokens, api_key=api_key)
             return llm.invoke(messages)
         except Exception as e:
             last_err = e
@@ -64,88 +75,110 @@ developer_tools = [
     search_workspace_file
 ]
 
+def parse_test_output(test_output: str) -> tuple[int, int]:
+    """Parse pytest output to extract real passed/failed counts.
+    Returns (passed, failed).
+    Special case: returns (-1, 0) when no tests were collected at all.
+    """
+    # No tests collected — return sentinel (-1) so UI can show "No tests" instead of "0 Passed"
+    if "NO_TESTS_COLLECTED" in test_output or "no tests ran" in test_output.lower():
+        return -1, 0
+
+    passed_m = re.search(r"(\d+)\s+passed", test_output, re.IGNORECASE)
+    failed_m = re.search(r"(\d+)\s+failed", test_output, re.IGNORECASE)
+    error_m  = re.search(r"(\d+)\s+error", test_output, re.IGNORECASE)
+
+    if passed_m or failed_m or error_m:
+        passed = int(passed_m.group(1)) if passed_m else 0
+        failed = (int(failed_m.group(1)) if failed_m else 0) + (int(error_m.group(1)) if error_m else 0)
+        return passed, failed
+
+    # Count individual PASSED/FAILED markers
+    if "PASSED" in test_output or "FAILED" in test_output:
+        passed = test_output.count("PASSED")
+        failed = test_output.count("FAILED")
+        return passed, failed
+
+    # No tests were collected — report as sentinel, do NOT fabricate
+    return -1, 0
+
 def developer_node(state: dict) -> dict:
     review_history = state.get("review_history", [])
     if not review_history:
         return state
-        
+
     latest_review = review_history[-1]
     filename = state.get("filename", "code_sample.py")
     iteration = state.get("iteration", 1)
-    
+
     # Read current code
     current_code = read_file(filename)
-    
-    # Build developer prompt — always include summary even if issues list is empty
+
+    # Build compact issue list — avoids verbose model_dump_json to save tokens
     if latest_review.issues:
-        issue_details = latest_review.model_dump_json(indent=2)
+        issue_lines = []
+        for idx, i in enumerate(latest_review.issues, 1):
+            line_info = f" (line {i.line})" if i.line else ""
+            fix_info  = f"\n   Fix: {i.suggestion}" if i.suggestion else ""
+            issue_lines.append(
+                f"{idx}. [{i.severity}] {i.title}{line_info} — must_fix={i.must_fix}\n"
+                f"   {i.description}{fix_info}"
+            )
+        issue_details = "\n".join(issue_lines)
+        issue_summary = f"Reviewer found {len(latest_review.issues)} issue(s). Score: {latest_review.score}/10."
     else:
+        issue_summary = f"Reviewer scored the code {latest_review.score}/10."
         issue_details = (
-            f"The reviewer reported:\n"
-            f"Summary: {latest_review.summary}\n\n"
-            f"Analyze the code yourself, identify all bugs, and fix them all."
+            f"Summary: {latest_review.summary}\n"
+            f"Score {latest_review.score}/10 indicates problems — analyse carefully and fix ALL bugs."
         )
 
-    prompt = f"""The Reviewer Agent has reviewed the code and found issues:
+    prompt = f"""{DEVELOPER_PROMPT}
 
+Reviewer Report:
+{issue_summary}
+
+Full Review Details:
 {issue_details}
 
 Current code in file '{filename}':
 {current_code}
 
-Fix ALL bugs in the code.
-Ensure:
-1. All reported issues are completely and cleanly resolved.
-2. Boundary and edge conditions are properly handled (e.g. overdraft checks, non-negative inputs, proper list filtering, min vs max).
-3. If the file contains embedded unit tests (e.g. test_* functions), ensure your fixes satisfy ALL of them.
-4. For EVERY bug you fix, add an inline comment directly above the fixed line:
+Fix ALL bugs. For EVERY fix, add a comment directly above:
 # [FIXED]: <Clear short explanation of what was fixed and why>
-(or // [FIXED]: ... for JavaScript/TypeScript/Java/C++).
-5. Return ONLY the complete fixed code with no markdown fences, no conversational text outside the code.
+Return ONLY the complete fixed code. No markdown fences. No extra text.
 """
-    
+
     try:
         result = invoke_developer_llm_with_fallback([HumanMessage(content=prompt)], temperature=0.0)
         fixed_code = result.content.strip()
-        
-        # Clean up markdown code blocks if present
+
+        # Strip markdown code fences if present
         if fixed_code.startswith("```"):
             lines = fixed_code.splitlines()
-            if len(lines) >= 2 and lines[-1].startswith("```"):
-                fixed_code = "\n".join(lines[1:-1]).strip()
-            elif lines[0].startswith("```"):
-                fixed_code = "\n".join(lines[1:]).strip()
-        
+            # Remove opening fence line
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            # Remove closing fence line
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            fixed_code = "\n".join(lines).strip()
+
         # Write the fixed code to workspace
         write_file(filename, fixed_code)
-        
-        # Run tests on the patched file
+
+        # Run actual tests and parse results honestly
         test_output = run_tests(filename)
-        
-        # Parse test results accurately using regex
-        passed_m = re.search(r"(\d+)\s+passed", test_output, re.IGNORECASE)
-        failed_m = re.search(r"(\d+)\s+failed", test_output, re.IGNORECASE)
-        
-        if passed_m or failed_m:
-            passed = int(passed_m.group(1)) if passed_m else 0
-            failed = int(failed_m.group(1)) if failed_m else 0
-        elif "PASSED" in test_output or "FAILED" in test_output:
-            passed = test_output.count("PASSED")
-            failed = test_output.count("FAILED")
-        else:
-            # If no pytest output or 0 items collected, match passed count to the number of issues fixed
-            num_issues = len(latest_review.issues) if (latest_review and latest_review.issues) else 1
-            passed = num_issues
-            failed = 0
-        
-        # Describe what was fixed per issue
+        passed, failed = parse_test_output(test_output)
+
+        # Describe changes
         if latest_review.issues:
             changes_list = [
-                i.suggestion if i.suggestion else f"Fixed {i.title}: corrected logic and validated with tests"
+                f"Fixed: {i.title}" + (f" — {i.suggestion}" if i.suggestion else "")
                 for i in latest_review.issues
             ]
         else:
-            changes_list = [f"Applied fixes based on reviewer feedback (Score was {latest_review.score}/10)"]
+            changes_list = [f"Applied general fixes based on reviewer feedback (Score: {latest_review.score}/10)"]
 
         patch_result = PatchResult(
             status="PATCHED",
@@ -158,10 +191,10 @@ Ensure:
             changes=[f"Failed to apply fixes: {str(e)}"],
             tests=TestMetrics(passed=0, failed=0)
         )
-    
+
     patch_history = state.get("patch_history", [])
     patch_history.append(patch_result)
-    
+
     return {
         "current_code": read_file(filename),
         "patch_history": patch_history,

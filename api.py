@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import shutil
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -20,9 +21,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ensure workspace exists
-if not os.path.exists(WORKSPACE_DIR):
+def clear_workspace():
+    """Remove all files from workspace before each new review run.
+    This prevents old test files from polluting pytest results."""
+    if os.path.exists(WORKSPACE_DIR):
+        shutil.rmtree(WORKSPACE_DIR)
     os.makedirs(WORKSPACE_DIR)
+
 
 
 async def run_workflow_stream(code: str, filename: str, max_iterations: int):
@@ -127,6 +132,8 @@ async def review_code(
     if not filename or filename in ("code_file.txt", "code_file.py"):
         filename = "test_code_sample.py" if "def test_" in code else "code_sample.py"
 
+    # Fresh workspace for each run — prevents old files from polluting test results
+    clear_workspace()
     write_file(filename, code)
 
     return StreamingResponse(
@@ -149,9 +156,10 @@ async def review_upload(
         return {"error": "GROQ_API_KEY not set"}
 
     code = (await file.read()).decode("utf-8")
-    # Keep the original extension for any language
     filename = file.filename or ("test_code_sample.py" if "def test_" in code else "code_sample.py")
 
+    # Fresh workspace for each run — prevents old files from polluting test results
+    clear_workspace()
     write_file(filename, code)
 
     return StreamingResponse(
